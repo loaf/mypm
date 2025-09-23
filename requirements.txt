@@ -1,0 +1,24 @@
+# MyPhotoApp 依赖包列表
+
+# GUI框架
+PyQt6>=6.0.0
+
+# 图像处理
+Pillow>=8.0.0
+
+# EXIF信息读取
+exifread>=2.3.2
+piexif>=1.1.3
+
+# 视频处理
+ffmpeg-python>=0.2.0
+
+# RAW文件处理
+rawpy>=0.16.0
+
+# 打包工具
+PyInstaller>=4.0
+
+# 开发和测试工具（可选）
+pytest>=6.0.0
+pytest-qt>=4.0.0
