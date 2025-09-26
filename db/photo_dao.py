@@ -167,6 +167,40 @@ class PhotoDAO:
             print(f"获取最近照片失败: {e}")
             return []
     
+    def get_all_photos(self) -> List[Dict]:
+        """
+        获取所有照片
+        
+        Returns:
+            所有照片列表
+        """
+        try:
+            self.db.cursor.execute('''
+                SELECT id, filename, path as relative_path, md5, size, created_at, 
+                       imported_at, type, exif_json, thumbnail_path, is_deleted
+                FROM photos 
+                WHERE is_deleted = 0 
+                ORDER BY imported_at DESC
+            ''')
+            
+            photos = []
+            for row in self.db.cursor.fetchall():
+                photo = dict(row)
+                if photo['exif_json']:
+                    try:
+                        photo['exif_data'] = json.loads(photo['exif_json'])
+                    except json.JSONDecodeError:
+                        photo['exif_data'] = {}
+                else:
+                    photo['exif_data'] = {}
+                photos.append(photo)
+            
+            return photos
+            
+        except sqlite3.Error as e:
+            print(f"获取所有照片失败: {e}")
+            return []
+    
     def get_photos_by_date_range(self, start_date: str, end_date: str) -> List[Dict]:
         """
         获取指定日期范围内的照片
@@ -435,3 +469,52 @@ class PhotoDAO:
             是否存在
         """
         return self.db.photo_exists(md5, size)
+    
+    def photo_exists_by_hash(self, md5: str, size: int) -> bool:
+        """
+        检查照片是否已存在（通过哈希值）
+        
+        Args:
+            md5: 文件MD5值
+            size: 文件大小
+            
+        Returns:
+            是否存在
+        """
+        return self.photo_exists(md5, size)
+    
+    def get_photos_by_directory(self, directory_path: str) -> List[Dict]:
+        """
+        根据目录路径获取照片
+        
+        Args:
+            directory_path: 目录路径
+            
+        Returns:
+            照片列表
+        """
+        try:
+            # 使用 LIKE 查询匹配目录路径
+            self.db.cursor.execute('''
+                SELECT * FROM photos 
+                WHERE path LIKE ? AND is_deleted = 0
+                ORDER BY filename ASC
+            ''', (f"{directory_path}%",))
+            
+            photos = []
+            for row in self.db.cursor.fetchall():
+                photo = dict(row)
+                if photo['exif_json']:
+                    try:
+                        photo['exif_data'] = json.loads(photo['exif_json'])
+                    except json.JSONDecodeError:
+                        photo['exif_data'] = {}
+                else:
+                    photo['exif_data'] = {}
+                photos.append(photo)
+            
+            return photos
+            
+        except sqlite3.Error as e:
+            print(f"按目录获取照片失败: {e}")
+            return []

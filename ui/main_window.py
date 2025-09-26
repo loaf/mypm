@@ -9,10 +9,11 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QSplitter, QTreeWidget, QTreeWidgetItem, QScrollArea, QLabel,
     QMenuBar, QStatusBar, QFrame, QTextEdit, QApplication, QMessageBox,
-    QFileDialog
+    QFileDialog, QListWidget, QListWidgetItem, QPushButton, QButtonGroup,
+    QDialog
 )
-from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QAction, QFont, QPixmap, QPalette
+from PyQt6.QtCore import Qt, QSize, QTimer
+from PyQt6.QtGui import QAction, QFont, QPixmap, QPalette, QKeySequence, QWheelEvent
 
 from photo_importer import PhotoImporter
 from ui.import_progress_dialog import ImportProgressDialog
@@ -31,7 +32,7 @@ class MainWindow(QMainWindow):
         
         # 初始化照片导入器
         self.photo_library_path = self.config_manager.get_photo_library_path()
-        self.db_path = "./db/photos.db"  # 数据库路径
+        self.db_path = self.config_manager.get_database_path()  # 数据库路径
         os.makedirs(self.photo_library_path, exist_ok=True)
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         
@@ -45,6 +46,12 @@ class MainWindow(QMainWindow):
         
         # 存储当前加载的照片数据
         self.current_photos = []
+        
+        # 单击双击处理
+        self.click_timer = QTimer()
+        self.click_timer.setSingleShot(True)
+        self.click_timer.timeout.connect(self.handle_single_click)
+        self.pending_click_data = None
         
         self.init_ui()
         self.setup_menu()
@@ -107,43 +114,439 @@ class MainWindow(QMainWindow):
         self.main_splitter.addWidget(left_widget)
         
     def setup_center_panel(self):
-        """设置中间缩略图区域"""
+        """设置中间照片浏览区域"""
         # 创建中间容器
         center_widget = QWidget()
         center_layout = QVBoxLayout(center_widget)
         center_layout.setContentsMargins(5, 5, 5, 5)
         
-        # 添加标题
-        title_label = QLabel("缩略图浏览")
-        title_label.setFont(QFont("Arial", 12, QFont.Weight.Bold))
-        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title_label.setStyleSheet("QLabel { background-color: #f0f0f0; padding: 8px; border: 1px solid #ccc; }")
-        center_layout.addWidget(title_label)
+        # 添加工具栏
+        self.setup_thumbnail_toolbar(center_layout)
         
-        # 创建滚动区域
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # 创建缩略图滚动区域
+        self.thumbnail_scroll = QScrollArea()
+        self.thumbnail_scroll.setWidgetResizable(True)
+        self.thumbnail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.thumbnail_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         
         # 创建缩略图容器
-        self.thumbnail_widget = QWidget()
-        self.thumbnail_layout = QGridLayout(self.thumbnail_widget)
-        self.thumbnail_layout.setSpacing(10)
+        self.thumbnail_container = QWidget()
+        self.thumbnail_layout = QGridLayout(self.thumbnail_container)
+        self.thumbnail_layout.setSpacing(5)  # 减少间距从10px到5px
+        self.thumbnail_layout.setContentsMargins(5, 5, 5, 5)  # 减少边距从10px到5px
+        # 设置网格布局左上对齐
         self.thumbnail_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         
-        # TODO: 后续阶段实现多线程缩略图加载
-        # 这里需要实现：
-        # 1. 异步加载图片缩略图
-        # 2. 使用QThread避免UI阻塞
-        # 3. 实现缩略图缓存机制
-        # 4. 支持大量图片的虚拟化显示
+        # 设置缩略图大小
+        self.thumbnail_size = 150  # 默认缩略图大小
+        self.min_thumbnail_size = 80
+        self.max_thumbnail_size = 300
         
-        self.scroll_area.setWidget(self.thumbnail_widget)
-        center_layout.addWidget(self.scroll_area)
+        # 设置滚动区域样式
+        self.thumbnail_scroll.setStyleSheet("""
+            QScrollArea {
+                background-color: #f8f9fa;
+                border: 1px solid #dee2e6;
+                border-radius: 8px;
+            }
+        """)
         
-        # 添加到分割器
+        # 安装事件过滤器以处理滚轮事件
+        self.thumbnail_scroll.installEventFilter(self)
+        
+        self.thumbnail_container.setStyleSheet("""
+            QWidget {
+                background-color: #ffffff;
+            }
+        """)
+        
+        self.thumbnail_scroll.setWidget(self.thumbnail_container)
+        center_layout.addWidget(self.thumbnail_scroll)
+        
+        # 添加到主分割器
         self.main_splitter.addWidget(center_widget)
+    
+    def setup_thumbnail_toolbar(self, parent_layout):
+        """设置缩略图工具栏"""
+        toolbar_widget = QWidget()
+        toolbar_layout = QHBoxLayout(toolbar_widget)
+        toolbar_layout.setContentsMargins(5, 5, 5, 5)
+        
+        # 标题标签
+        title_label = QLabel("照片缩略图")
+        title_label.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        toolbar_layout.addWidget(title_label)
+        
+        toolbar_layout.addStretch()
+        
+        # 缩放控制
+        zoom_label = QLabel("缩放:")
+        toolbar_layout.addWidget(zoom_label)
+        
+        # 缩小按钮
+        zoom_out_btn = QPushButton("-")
+        zoom_out_btn.setFixedSize(30, 30)
+        zoom_out_btn.clicked.connect(self.zoom_out_thumbnails)
+        toolbar_layout.addWidget(zoom_out_btn)
+        
+        # 缩放显示
+        self.zoom_label = QLabel("150px")
+        self.zoom_label.setMinimumWidth(50)
+        self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        toolbar_layout.addWidget(self.zoom_label)
+        
+        # 放大按钮
+        zoom_in_btn = QPushButton("+")
+        zoom_in_btn.setFixedSize(30, 30)
+        zoom_in_btn.clicked.connect(self.zoom_in_thumbnails)
+        toolbar_layout.addWidget(zoom_in_btn)
+        
+        # 重置按钮
+        reset_btn = QPushButton("重置")
+        reset_btn.clicked.connect(self.reset_thumbnail_zoom)
+        toolbar_layout.addWidget(reset_btn)
+        
+        # 工具栏样式
+        toolbar_widget.setStyleSheet("""
+            QWidget {
+                background-color: #f8f9fa;
+                border: 1px solid #dee2e6;
+                border-radius: 6px;
+                margin-bottom: 5px;
+            }
+            QPushButton {
+                background-color: #ffffff;
+                border: 1px solid #dee2e6;
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background-color: #e9ecef;
+                border-color: #adb5bd;
+            }
+            QPushButton:pressed {
+                background-color: #dee2e6;
+            }
+        """)
+        
+        parent_layout.addWidget(toolbar_widget)
+        
+    def zoom_in_thumbnails(self):
+        """放大缩略图"""
+        if self.thumbnail_size < self.max_thumbnail_size:
+            self.thumbnail_size += 20
+            self.update_thumbnail_size()
+    
+    def zoom_out_thumbnails(self):
+        """缩小缩略图"""
+        if self.thumbnail_size > self.min_thumbnail_size:
+            self.thumbnail_size -= 20
+            self.update_thumbnail_size()
+    
+    def reset_thumbnail_zoom(self):
+        """重置缩略图大小"""
+        self.thumbnail_size = 150
+        self.update_thumbnail_size()
+    
+    def update_thumbnail_size(self):
+        """更新缩略图大小"""
+        self.zoom_label.setText(f"{self.thumbnail_size}px")
+        # 重新加载缩略图
+        self.load_photo_thumbnails()
+    
+    def eventFilter(self, obj, event):
+        """事件过滤器，处理滚轮缩放"""
+        if obj == self.thumbnail_scroll and event.type() == event.Type.Wheel:
+            # 检查是否按下Ctrl键
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                # 获取滚轮滚动方向
+                delta = event.angleDelta().y()
+                if delta > 0:
+                    self.zoom_in_thumbnails()
+                else:
+                    self.zoom_out_thumbnails()
+                return True  # 事件已处理
+        return super().eventFilter(obj, event)
+        
+    def load_photo_thumbnails(self):
+        """加载照片缩略图到网格布局"""
+        # 清空现有的缩略图
+        for i in reversed(range(self.thumbnail_layout.count())):
+            child = self.thumbnail_layout.itemAt(i).widget()
+            if child:
+                child.setParent(None)
+        
+        # 获取当前选中的目录
+        current_item = self.directory_tree.currentItem()
+        if not current_item:
+            return
+        
+        directory_path = current_item.data(0, Qt.ItemDataRole.UserRole)
+        if not directory_path:
+            return
+        
+        # 根据目录类型获取照片数据
+        photos = []
+        if directory_path == "recent":
+            # 最近导入
+            photos = self.dao_manager.get_recent_photos(20)
+        elif directory_path.startswith("year_"):
+            # 按年份筛选
+            year = directory_path.split("_")[1]
+            photos = self.dao_manager.get_photos_by_year(int(year))
+        elif directory_path.startswith("month_"):
+            # 按月份筛选
+            parts = directory_path.split("_")
+            year, month = int(parts[1]), int(parts[2])
+            photos = self.dao_manager.get_photos_by_month(year, month)
+        else:
+            # 普通目录路径，使用目录查询
+            photos = self.dao_manager.photo_dao.get_photos_by_directory(directory_path)
+        
+        if not photos:
+            # 显示空状态
+            empty_label = QLabel("此目录中没有照片")
+            empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty_label.setStyleSheet("""
+                QLabel {
+                    color: #6c757d;
+                    font-size: 16px;
+                    padding: 40px;
+                    background-color: #f8f9fa;
+                    border: 2px dashed #dee2e6;
+                    border-radius: 12px;
+                }
+            """)
+            self.thumbnail_layout.addWidget(empty_label, 0, 0, 1, -1)
+            return
+        
+        # 计算每行的列数
+        container_width = self.thumbnail_container.width() - 20  # 减去边距（从40减少到20）
+        if container_width <= 0:
+            container_width = 800  # 默认宽度
+        
+        cols = max(1, container_width // (self.thumbnail_size + 10))  # 减少间距从20px到10px
+        
+        # 添加缩略图到网格
+        for i, photo in enumerate(photos):
+            row = i // cols
+            col = i % cols
+            
+            thumbnail_widget = self.create_thumbnail_widget(photo, i)
+            self.thumbnail_layout.addWidget(thumbnail_widget, row, col)
+    
+    def create_thumbnail_widget(self, photo, index):
+        """创建单个缩略图控件"""
+        widget = QWidget()
+        widget.setFixedSize(self.thumbnail_size, self.thumbnail_size + 40)  # 额外40px用于文件名
+        widget.setCursor(Qt.CursorShape.PointingHandCursor)
+        
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(3, 3, 3, 3)  # 减少内边距从5px到3px
+        layout.setSpacing(2)  # 减少间距从5px到2px
+        
+        # 创建缩略图标签
+        thumbnail_label = QLabel()
+        thumbnail_label.setFixedSize(self.thumbnail_size - 10, self.thumbnail_size - 10)
+        thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        thumbnail_label.setStyleSheet("""
+            QLabel {
+                background-color: #f8f9fa;
+                border: 2px solid #dee2e6;
+                border-radius: 8px;
+            }
+        """)
+        
+        # 加载缩略图
+        self.load_thumbnail_image(thumbnail_label, photo)
+        
+        # 创建文件名标签
+        filename = os.path.basename(photo.get('path', '未知文件'))
+        if len(filename) > 15:
+            filename = filename[:12] + "..."
+        
+        name_label = QLabel(filename)
+        name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        name_label.setStyleSheet("""
+            QLabel {
+                color: #495057;
+                font-size: 11px;
+                background-color: transparent;
+                border: none;
+                padding: 2px;
+            }
+        """)
+        
+        layout.addWidget(thumbnail_label)
+        layout.addWidget(name_label)
+        
+        # 设置整体样式
+        widget.setStyleSheet("""
+            QWidget {
+                background-color: white;
+                border: 1px solid #e9ecef;
+                border-radius: 8px;
+                margin: 2px;
+            }
+            QWidget:hover {
+                background-color: #f8f9fa;
+                border-color: #007bff;
+            }
+        """)
+        
+        # 绑定点击事件 - 支持单击和双击区分
+        widget.mousePressEvent = lambda event: self.on_thumbnail_press(photo, index, event)
+        widget.mouseDoubleClickEvent = lambda event: self.on_thumbnail_double_click(photo, index, event)
+        
+        return widget
+    
+    def load_thumbnail_image(self, label, photo):
+        """加载缩略图图片"""
+        # 尝试多种路径方式
+        possible_paths = [
+            photo.get('path', ''),
+            photo.get('file_path', ''),
+            os.path.join(self.photo_library_path, photo.get('path', '')),
+            os.path.join(self.photo_library_path, photo.get('file_path', ''))
+        ]
+        
+        for path in possible_paths:
+            if path and os.path.exists(path):
+                try:
+                    pixmap = QPixmap(path)
+                    if not pixmap.isNull():
+                        # 缩放到合适大小
+                        scaled_pixmap = pixmap.scaled(
+                            self.thumbnail_size - 20, self.thumbnail_size - 20,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation
+                        )
+                        label.setPixmap(scaled_pixmap)
+                        return
+                except Exception as e:
+                    print(f"加载缩略图失败: {e}")
+        
+        # 如果无法加载图片，显示占位符
+        label.setText("无法\n加载")
+        label.setStyleSheet(label.styleSheet() + "color: #6c757d; font-size: 12px;")
+    
+    def on_thumbnail_press(self, photo, index, event):
+        """处理缩略图按下事件（用于区分单击和双击）"""
+        if event.button() == Qt.MouseButton.LeftButton:
+            # 存储点击数据，等待判断是单击还是双击
+            self.pending_click_data = (photo, index)
+            # 启动定时器，如果在定时器超时前没有双击，则处理为单击
+            self.click_timer.start(300)  # 300ms内如果有双击则取消单击
+    
+    def on_thumbnail_double_click(self, photo, index, event):
+        """处理缩略图双击事件"""
+        if event.button() == Qt.MouseButton.LeftButton:
+            # 停止单击定时器
+            self.click_timer.stop()
+            self.pending_click_data = None
+            
+            # 处理双击 - 打开预览窗口
+            self.open_photo_preview(photo)
+    
+    def handle_single_click(self):
+        """处理单击事件（定时器超时后调用）"""
+        if self.pending_click_data:
+            photo, index = self.pending_click_data
+            self.pending_click_data = None
+            
+            # 处理单击 - 显示照片信息
+            self.show_photo_info(photo)
+    
+    def open_photo_preview(self, photo):
+        """打开照片预览窗口"""
+        # 尝试多种路径方式，与load_thumbnail_image保持一致
+        possible_paths = [
+            photo.get('path', ''),
+            photo.get('file_path', ''),
+            os.path.join(self.photo_library_path, photo.get('path', '')),
+            os.path.join(self.photo_library_path, photo.get('file_path', ''))
+        ]
+        
+        photo_path = None
+        for path in possible_paths:
+            if path and os.path.exists(path):
+                photo_path = path
+                break
+        
+        if photo_path:
+            print(f"双击缩略图，打开预览: {photo_path}")
+            # 打开预览对话框
+            preview_dialog = PhotoPreviewDialog(photo_path, self)
+            preview_dialog.exec()
+        else:
+            print("照片文件不存在或路径无效")
+    
+    def show_photo_info(self, photo):
+        """在右侧面板显示照片信息"""
+        print(f"单击缩略图，显示信息: {photo.get('path', 'N/A')}")
+        
+        # 获取照片路径
+        possible_paths = [
+            photo.get('path', ''),
+            photo.get('file_path', ''),
+            os.path.join(self.photo_library_path, photo.get('path', '')),
+            os.path.join(self.photo_library_path, photo.get('file_path', ''))
+        ]
+        
+        photo_path = None
+        for path in possible_paths:
+            if path and os.path.exists(path):
+                photo_path = path
+                break
+        
+        # 构建信息HTML
+        info_html = "<h3>照片信息</h3>"
+        
+        if photo_path:
+            # 基本文件信息
+            filename = os.path.basename(photo_path)
+            file_size = os.path.getsize(photo_path)
+            file_size_mb = file_size / (1024 * 1024)
+            
+            # 获取图片尺寸
+            try:
+                pixmap = QPixmap(photo_path)
+                if not pixmap.isNull():
+                    width = pixmap.width()
+                    height = pixmap.height()
+                    resolution = f"{width} × {height}"
+                else:
+                    resolution = "无法获取"
+            except:
+                resolution = "无法获取"
+            
+            info_html += f"""
+            <p><b>文件名：</b>{filename}</p>
+            <p><b>文件大小：</b>{file_size_mb:.2f} MB</p>
+            <p><b>分辨率：</b>{resolution}</p>
+            <p><b>文件路径：</b>{photo_path}</p>
+            """
+            
+            # 数据库信息
+            if photo.get('created_at'):
+                info_html += f"<p><b>导入时间：</b>{photo.get('created_at')}</p>"
+            if photo.get('file_hash'):
+                info_html += f"<p><b>文件哈希：</b>{photo.get('file_hash')[:16]}...</p>"
+            
+            info_html += "<hr><p><i>双击缩略图可打开预览窗口</i></p>"
+        else:
+            info_html += """
+            <p><b>文件名：</b>文件不存在</p>
+            <p><b>状态：</b>文件路径无效或文件已被移动</p>
+            <hr>
+            <p><i>请检查文件是否存在</i></p>
+            """
+        
+        # 更新右侧信息面板
+        self.info_display.setHtml(info_html)
+    
+
         
     def setup_right_panel(self):
         """设置右侧信息面板"""
@@ -162,8 +565,14 @@ class MainWindow(QMainWindow):
         # 创建信息显示区域
         self.info_display = QTextEdit()
         self.info_display.setReadOnly(True)
-        self.info_display.setMaximumHeight(300)
-        self.info_display.setStyleSheet("QTextEdit { background-color: #fafafa; border: 1px solid #ddd; }")
+        self.info_display.setStyleSheet("""
+            QTextEdit { 
+                background-color: #fafafa; 
+                border: 1px solid #ddd; 
+                font-size: 12px;
+                padding: 10px;
+            }
+        """)
         
         # 设置默认信息
         default_info = """
@@ -180,19 +589,8 @@ class MainWindow(QMainWindow):
         self.info_display.setHtml(default_info)
         right_layout.addWidget(self.info_display)
         
-        # 添加预览区域（占位）
-        preview_label = QLabel("照片预览")
-        preview_label.setFont(QFont("Arial", 10, QFont.Weight.Bold))
-        preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        preview_label.setStyleSheet("QLabel { background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; }")
-        right_layout.addWidget(preview_label)
-        
-        self.preview_area = QLabel()
-        self.preview_area.setMinimumHeight(200)
-        self.preview_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_area.setStyleSheet("QLabel { background-color: #ffffff; border: 2px dashed #ccc; }")
-        self.preview_area.setText("预览区域\n(暂无图片)")
-        right_layout.addWidget(self.preview_area)
+        # 添加弹性空间，使信息区域占满剩余空间
+        right_layout.addStretch()
         
         # 添加到分割器
         self.main_splitter.addWidget(right_widget)
@@ -236,6 +634,19 @@ class MainWindow(QMainWindow):
         preferences_action.setStatusTip("打开应用程序设置")
         preferences_action.triggered.connect(self.open_preferences)
         config_menu.addAction(preferences_action)
+        
+        # 工具菜单
+        tools_menu = menubar.addMenu("工具(&T)")
+        
+        cleanup_db_action = QAction("整理数据库(&C)...", self)
+        cleanup_db_action.setStatusTip("清理数据库中的无效记录")
+        cleanup_db_action.triggered.connect(self.cleanup_database)
+        tools_menu.addAction(cleanup_db_action)
+        
+        sync_db_action = QAction("同步数据库(&S)...", self)
+        sync_db_action.setStatusTip("同步照片库与数据库")
+        sync_db_action.triggered.connect(self.sync_database)
+        tools_menu.addAction(sync_db_action)
         
         # 帮助菜单
         help_menu = menubar.addMenu("帮助(&H)")
@@ -341,112 +752,17 @@ class MainWindow(QMainWindow):
         self.directory_tree.expandItem(root_item)
         
         # 显示空的缩略图区域
-        self.load_sample_thumbnails()
+        self.load_photo_thumbnails()
     
-    def load_photo_thumbnails(self):
-        """从数据库照片数据加载缩略图"""
-        # 清空现有缩略图
-        for i in reversed(range(self.thumbnail_layout.count())):
-            child = self.thumbnail_layout.itemAt(i).widget()
-            if child:
-                child.setParent(None)
+    def on_directory_item_clicked(self, item, column):
+        """处理目录树点击事件"""
+        directory_path = item.data(0, Qt.ItemDataRole.UserRole)
+        if directory_path and directory_path != "empty":
+            print(f"选择目录: {directory_path}")
+            # 重新加载该目录的缩略图
+            self.load_photo_thumbnails()
         
-        if not self.current_photos:
-            # 如果没有照片，显示提示信息
-            no_photos_label = QLabel("暂无照片\n请导入照片到照片库")
-            no_photos_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            no_photos_label.setStyleSheet("""
-                QLabel {
-                    color: #666;
-                    font-size: 16px;
-                    padding: 40px;
-                }
-            """)
-            self.thumbnail_layout.addWidget(no_photos_label, 0, 0, 1, 4)
-            return
-        
-        # 创建照片缩略图
-        for i, photo in enumerate(self.current_photos):
-            if i >= 20:  # 最多显示20张
-                break
-                
-            thumbnail = QLabel()
-            thumbnail.setFixedSize(120, 120)
-            thumbnail.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            thumbnail.setStyleSheet("""
-                QLabel {
-                    background-color: #f5f5f5;
-                    border: 2px solid #ddd;
-                    border-radius: 5px;
-                }
-                QLabel:hover {
-                    border-color: #007acc;
-                    background-color: #f0f8ff;
-                }
-            """)
-            
-            # 尝试加载实际缩略图
-            thumbnail_path = photo.get('thumbnail_path')
-            if thumbnail_path and os.path.exists(thumbnail_path):
-                try:
-                    pixmap = QPixmap(thumbnail_path)
-                    if not pixmap.isNull():
-                        # 缩放图片以适应缩略图大小
-                        scaled_pixmap = pixmap.scaled(
-                            116, 116, 
-                            Qt.AspectRatioMode.KeepAspectRatio, 
-                            Qt.TransformationMode.SmoothTransformation
-                        )
-                        thumbnail.setPixmap(scaled_pixmap)
-                    else:
-                        thumbnail.setText(f"{photo['filename'][:10]}...\n(缩略图损坏)")
-                except Exception as e:
-                    print(f"加载缩略图失败: {e}")
-                    thumbnail.setText(f"{photo['filename'][:10]}...\n(加载失败)")
-            else:
-                # 显示文件名作为占位符
-                display_name = photo['filename']
-                if len(display_name) > 15:
-                    display_name = display_name[:12] + "..."
-                thumbnail.setText(f"{display_name}\n{photo['type'].upper()}")
-            
-            # 设置点击事件
-            thumbnail.mousePressEvent = lambda event, idx=i: self.on_photo_thumbnail_clicked(idx)
-            
-            # 添加到网格布局
-            row = i // 4
-            col = i % 4
-            self.thumbnail_layout.addWidget(thumbnail, row, col)
-        
-    def load_sample_thumbnails(self):
-        """加载示例缩略图（占位）"""
-        # 清空现有缩略图
-        for i in reversed(range(self.thumbnail_layout.count())):
-            self.thumbnail_layout.itemAt(i).widget().setParent(None)
-            
-        # 创建示例缩略图
-        for i in range(12):  # 创建12个占位缩略图
-            thumbnail = QLabel()
-            thumbnail.setFixedSize(120, 120)
-            thumbnail.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            thumbnail.setStyleSheet("""
-                QLabel {
-                    background-color: #e0e0e0;
-                    border: 2px solid #ccc;
-                    border-radius: 5px;
-                }
-                QLabel:hover {
-                    border-color: #007acc;
-                    background-color: #f0f8ff;
-                }
-            """)
-            thumbnail.setText(f"照片 {i+1:02d}\n(占位)")
-            thumbnail.mousePressEvent = lambda event, idx=i: self.on_thumbnail_clicked(idx)
-            
-            # 添加到网格布局
-            row = i // 4
-            col = i % 4
-            self.thumbnail_layout.addWidget(thumbnail, row, col)
+
             
     def on_directory_selected(self):
         """目录树选择事件"""
@@ -456,31 +772,17 @@ class MainWindow(QMainWindow):
             folder_name = current_item.text(0)
             self.status_bar.showMessage(f"已选择目录: {folder_name}")
             
-            # 根据选择的目录类型加载对应的照片
-            if folder_path == "recent":
-                # 最近导入
-                self.current_photos = self.dao_manager.get_recent_photos(20)
-                self.load_photo_thumbnails()
-            elif folder_path.startswith("year_"):
-                # 按年份筛选
-                year = folder_path.split("_")[1]
-                self.current_photos = self.dao_manager.get_photos_by_year(int(year))
-                self.load_photo_thumbnails()
-            elif folder_path.startswith("month_"):
-                # 按月份筛选
-                parts = folder_path.split("_")
-                year, month = int(parts[1]), int(parts[2])
-                self.current_photos = self.dao_manager.get_photos_by_month(year, month)
-                self.load_photo_thumbnails()
+            # 加载对应的照片缩略图
+            self.load_photo_thumbnails()
             
             print(f"目录选择: {folder_name} -> {folder_path}")
     
-    def on_photo_thumbnail_clicked(self, index):
-        """数据库照片缩略图点击事件"""
-        if index >= len(self.current_photos):
+    def on_photo_list_item_clicked(self, item):
+        """照片列表项点击事件"""
+        photo = item.data(Qt.ItemDataRole.UserRole)
+        if not photo:
             return
             
-        photo = self.current_photos[index]
         self.status_bar.showMessage(f"已选择照片: {photo['filename']}")
         
         # 格式化文件大小
@@ -536,26 +838,7 @@ class MainWindow(QMainWindow):
         self.info_display.setHtml(photo_info)
         
         # 更新预览区域
-        full_path = os.path.join(self.photo_library_path, photo['path'])
-        if os.path.exists(full_path):
-            try:
-                pixmap = QPixmap(full_path)
-                if not pixmap.isNull():
-                    # 缩放图片以适应预览区域
-                    scaled_pixmap = pixmap.scaled(
-                        self.preview_area.size(), 
-                        Qt.AspectRatioMode.KeepAspectRatio, 
-                        Qt.TransformationMode.SmoothTransformation
-                    )
-                    self.preview_area.setPixmap(scaled_pixmap)
-                    self.preview_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                else:
-                    self.preview_area.setText("图片预览失败")
-            except Exception as e:
-                print(f"预览图片失败: {e}")
-                self.preview_area.setText("图片预览失败")
-        else:
-            self.preview_area.setText("图片文件不存在")
+        self.update_photo_preview(photo)
         
         print(f"照片点击: {photo['filename']} (ID: {photo['id']})")
             
@@ -578,7 +861,33 @@ class MainWindow(QMainWindow):
         self.info_display.setHtml(sample_info)
         
         # 更新预览区域
-        self.preview_area.setText(f"照片 {index+1:02d} 预览\n(占位图片)")
+        self.preview_label.setText(f"照片 {index+1:02d} 预览\n(占位图片)")
+    
+    def keyPressEvent(self, event):
+        """处理键盘事件"""
+        if event.key() == Qt.Key.Key_Up:
+            self.navigate_photo(-1)
+        elif event.key() == Qt.Key.Key_Down:
+            self.navigate_photo(1)
+        else:
+            super().keyPressEvent(event)
+    
+    def navigate_photo(self, direction):
+        """键盘导航照片 direction: -1向上, 1向下"""
+        current_row = self.photo_list.currentRow()
+        if current_row == -1:
+            # 如果没有选中项，选择第一项
+            if self.photo_list.count() > 0:
+                self.photo_list.setCurrentRow(0)
+            return
+        
+        new_row = current_row + direction
+        if 0 <= new_row < self.photo_list.count():
+            self.photo_list.setCurrentRow(new_row)
+            # 触发点击事件
+            item = self.photo_list.item(new_row)
+            if item:
+                self.photo_list.itemClicked.emit(item)
         
         print(f"缩略图点击: 照片 {index+1:02d}")
         
@@ -701,9 +1010,276 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("首选项功能 - 待实现")
         
     def show_about(self):
-        """显示关于对话框槽函数"""
-        print("关于 clicked")
-        self.status_bar.showMessage("关于对话框 - 待实现")
+        """显示关于对话框"""
+        QMessageBox.about(self, "关于", 
+                         "照片管理软件 v1.0\n\n"
+                         "一个简单易用的照片管理工具")
+    
+    def cleanup_database(self):
+        """整理数据库：扫描数据库并删除无效记录"""
+        try:
+            # 显示进度对话框
+            from PyQt6.QtWidgets import QProgressDialog
+            progress = QProgressDialog("正在整理数据库...", "取消", 0, 0, self)
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setAutoClose(True)
+            progress.setAutoReset(True)
+            progress.show()
+            QApplication.processEvents()
+            
+            # 获取所有照片记录
+            all_photos = self.dao_manager.photo_dao.get_all_photos()
+            total_photos = len(all_photos)
+            
+            if total_photos == 0:
+                progress.close()
+                QMessageBox.information(self, "整理完成", "数据库中没有照片记录。")
+                return
+            
+            progress.setMaximum(total_photos)
+            invalid_count = 0
+            
+            # 检查每张照片的文件是否存在
+            for i, photo in enumerate(all_photos):
+                if progress.wasCanceled():
+                    break
+                
+                progress.setValue(i)
+                progress.setLabelText(f"正在检查照片 {i+1}/{total_photos}: {photo['filename']}")
+                QApplication.processEvents()
+                
+                # 构建完整路径
+                photo_library_path = self.config_manager.get_photo_library_path()
+                full_path = os.path.join(photo_library_path, photo['relative_path'])
+                
+                # 检查文件是否存在
+                if not os.path.exists(full_path):
+                    # 文件不存在，标记为删除
+                    self.dao_manager.photo_dao.delete_photo(photo['id'], soft_delete=True)
+                    invalid_count += 1
+            
+            progress.close()
+            
+            if not progress.wasCanceled():
+                # 刷新界面
+                self.load_recent_photos()
+                QMessageBox.information(
+                    self, 
+                    "整理完成", 
+                    f"数据库整理完成！\n\n"
+                    f"检查了 {total_photos} 张照片\n"
+                    f"删除了 {invalid_count} 条无效记录"
+                )
+            
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"整理数据库时发生错误：\n{str(e)}")
+    
+    def sync_database(self):
+        """同步数据库：扫描照片库并导入新照片"""
+        # 显示确认对话框
+        reply = QMessageBox.question(
+            self,
+            "确认同步",
+            "同步数据库将扫描整个照片库并导入新照片。\n\n"
+            "这个过程可能需要较长时间，特别是当照片库很大时。\n"
+            "在同步过程中，请不要关闭程序。\n\n"
+            "是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        
+        try:
+            # 首先执行数据库整理
+            self._cleanup_database_silent()
+            
+            # 显示进度对话框
+            from PyQt6.QtWidgets import QProgressDialog
+            progress = QProgressDialog("正在同步数据库...", "取消", 0, 0, self)
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setAutoClose(True)
+            progress.setAutoReset(True)
+            progress.show()
+            QApplication.processEvents()
+            
+            # 获取照片库路径
+            photo_library_path = self.config_manager.get_photo_library_path()
+            if not photo_library_path or not os.path.exists(photo_library_path):
+                progress.close()
+                QMessageBox.warning(self, "错误", "照片库路径无效或不存在。")
+                return
+            
+            # 扫描照片库
+            progress.setLabelText("正在扫描照片库...")
+            QApplication.processEvents()
+            
+            photo_files = []
+            supported_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif', '.raw', '.cr2', '.nef', '.arw'}
+            
+            for root, dirs, files in os.walk(photo_library_path):
+                if progress.wasCanceled():
+                    break
+                
+                for file in files:
+                    if any(file.lower().endswith(ext) for ext in supported_extensions):
+                        photo_files.append(os.path.join(root, file))
+            
+            if progress.wasCanceled():
+                progress.close()
+                return
+            
+            total_files = len(photo_files)
+            progress.setMaximum(total_files)
+            imported_count = 0
+            
+            # 导入新照片
+            for i, file_path in enumerate(photo_files):
+                if progress.wasCanceled():
+                    break
+                
+                progress.setValue(i)
+                progress.setLabelText(f"正在处理 {i+1}/{total_files}: {os.path.basename(file_path)}")
+                QApplication.processEvents()
+                
+                try:
+                    # 检查照片是否已存在
+                    import hashlib
+                    file_size = os.path.getsize(file_path)
+                    with open(file_path, 'rb') as f:
+                        file_hash = hashlib.md5(f.read()).hexdigest()
+                    
+                    if not self.dao_manager.photo_dao.photo_exists_by_hash(file_hash, file_size):
+                        # 照片不存在，导入
+                        result = self.photo_importer.import_single_photo(file_path)
+                        if result:
+                            imported_count += 1
+                except Exception as e:
+                    print(f"导入照片失败 {file_path}: {e}")
+                    continue
+            
+            progress.close()
+            
+            if not progress.wasCanceled():
+                # 刷新界面
+                self.load_recent_photos()
+                QMessageBox.information(
+                    self,
+                    "同步完成",
+                    f"数据库同步完成！\n\n"
+                    f"扫描了 {total_files} 个文件\n"
+                    f"导入了 {imported_count} 张新照片"
+                )
+            
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"同步数据库时发生错误：\n{str(e)}")
+    
+    def _cleanup_database_silent(self):
+        """静默整理数据库（不显示进度和结果）"""
+        try:
+            # 获取所有照片记录
+            all_photos = self.dao_manager.photo_dao.get_all_photos()
+            
+            # 检查每张照片的文件是否存在
+            photo_library_path = self.config_manager.get_photo_library_path()
+            for photo in all_photos:
+                full_path = os.path.join(photo_library_path, photo['relative_path'])
+                if not os.path.exists(full_path):
+                    # 文件不存在，标记为删除
+                    self.dao_manager.photo_dao.delete_photo(photo['id'], soft_delete=True)
+                    
+        except Exception as e:
+            print(f"静默整理数据库时发生错误: {e}")
+
+
+class PhotoPreviewDialog(QDialog):
+    """照片预览对话框"""
+    
+    def __init__(self, photo_path, parent=None):
+        super().__init__(parent)
+        self.photo_path = photo_path
+        self.init_ui()
+        
+    def init_ui(self):
+        """初始化界面"""
+        self.setWindowTitle("照片预览")
+        self.setModal(True)
+        self.resize(800, 600)
+        
+        # 主布局
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 滚动区域
+        scroll_area = QScrollArea()
+        scroll_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        scroll_area.setStyleSheet("""
+            QScrollArea {
+                background-color: #2b2b2b;
+                border: none;
+            }
+        """)
+        
+        # 图片标签
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setStyleSheet("background-color: #2b2b2b;")
+        
+        # 加载图片
+        self.load_image()
+        
+        scroll_area.setWidget(self.image_label)
+        layout.addWidget(scroll_area)
+        
+        # 工具栏
+        toolbar = QHBoxLayout()
+        toolbar.setContentsMargins(10, 5, 10, 10)
+        
+        # 关闭按钮
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.close)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4a4a4a;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #5a5a5a;
+            }
+        """)
+        
+        toolbar.addStretch()
+        toolbar.addWidget(close_btn)
+        layout.addLayout(toolbar)
+        
+    def load_image(self):
+        """加载图片"""
+        try:
+            if os.path.exists(self.photo_path):
+                pixmap = QPixmap(self.photo_path)
+                if not pixmap.isNull():
+                    # 缩放图片以适应窗口
+                    scaled_pixmap = pixmap.scaled(
+                        750, 550,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation
+                    )
+                    self.image_label.setPixmap(scaled_pixmap)
+                else:
+                    self.image_label.setText("无法加载图片")
+                    self.image_label.setStyleSheet("color: white; font-size: 16px;")
+            else:
+                self.image_label.setText("图片文件不存在")
+                self.image_label.setStyleSheet("color: white; font-size: 16px;")
+        except Exception as e:
+            print(f"加载图片失败: {e}")
+            self.image_label.setText("加载图片失败")
+            self.image_label.setStyleSheet("color: white; font-size: 16px;")
 
 
 if __name__ == "__main__":

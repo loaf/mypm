@@ -153,6 +153,17 @@ class ConfigManager:
         
         self.save_config()
     
+    def get_database_path(self) -> str:
+        """
+        获取数据库文件路径
+        数据库文件位于照片库根目录下的 .library.db
+        
+        Returns:
+            数据库文件的完整路径
+        """
+        photo_library_path = self.get_photo_library_path()
+        return os.path.join(photo_library_path, ".library.db")
+    
     def get_recent_photo_libraries(self) -> list:
         """获取最近使用的照片库路径列表"""
         return self.get('photo_library.recent_paths', [])
