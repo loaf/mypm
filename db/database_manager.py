@@ -244,14 +244,28 @@ class DatabaseManager:
                 self.connect()
                 
             self.database.cursor.execute('''
-                SELECT id, filename, md5, size, created_at, path as relative_path, type as photo_type
+                SELECT id, filename, md5, size, created_at, path as relative_path, 
+                       type as photo_type, exif_json, imported_at, thumbnail_path
                 FROM photos
                 WHERE is_deleted = 0
                 ORDER BY created_at DESC
             ''')
             
-            columns = [description[0] for description in self.database.cursor.description]
-            return [dict(zip(columns, row)) for row in self.database.cursor.fetchall()]
+            photos = []
+            for row in self.database.cursor.fetchall():
+                photo = dict(row)
+                # 解析 exif_json 为 exif_data
+                if photo['exif_json']:
+                    try:
+                        import json
+                        photo['exif_data'] = json.loads(photo['exif_json'])
+                    except json.JSONDecodeError:
+                        photo['exif_data'] = {}
+                else:
+                    photo['exif_data'] = {}
+                photos.append(photo)
+            
+            return photos
             
         except sqlite3.Error as e:
             print(f"查询所有照片失败: {e}")

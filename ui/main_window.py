@@ -20,6 +20,14 @@ from ui.import_progress_dialog import ImportProgressDialog
 from core.config_manager import ConfigManager
 from db.dao_manager import DAOManager
 
+# 可选的WebEngine地图支持
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    WEB_ENGINE_AVAILABLE = True
+except Exception:
+    QWebEngineView = None
+    WEB_ENGINE_AVAILABLE = False
+
 
 class MainWindow(QMainWindow):
     """照片管理软件主窗口"""
@@ -483,68 +491,13 @@ class MainWindow(QMainWindow):
             print("照片文件不存在或路径无效")
     
     def show_photo_info(self, photo):
-        """在右侧面板显示照片信息"""
-        print(f"单击缩略图，显示信息: {photo.get('path', 'N/A')}")
-        
-        # 获取照片路径
-        possible_paths = [
-            photo.get('path', ''),
-            photo.get('file_path', ''),
-            os.path.join(self.photo_library_path, photo.get('path', '')),
-            os.path.join(self.photo_library_path, photo.get('file_path', ''))
-        ]
-        
-        photo_path = None
-        for path in possible_paths:
-            if path and os.path.exists(path):
-                photo_path = path
-                break
-        
-        # 构建信息HTML
-        info_html = "<h3>照片信息</h3>"
-        
-        if photo_path:
-            # 基本文件信息
-            filename = os.path.basename(photo_path)
-            file_size = os.path.getsize(photo_path)
-            file_size_mb = file_size / (1024 * 1024)
-            
-            # 获取图片尺寸
-            try:
-                pixmap = QPixmap(photo_path)
-                if not pixmap.isNull():
-                    width = pixmap.width()
-                    height = pixmap.height()
-                    resolution = f"{width} × {height}"
-                else:
-                    resolution = "无法获取"
-            except:
-                resolution = "无法获取"
-            
-            info_html += f"""
-            <p><b>文件名：</b>{filename}</p>
-            <p><b>文件大小：</b>{file_size_mb:.2f} MB</p>
-            <p><b>分辨率：</b>{resolution}</p>
-            <p><b>文件路径：</b>{photo_path}</p>
-            """
-            
-            # 数据库信息
-            if photo.get('created_at'):
-                info_html += f"<p><b>导入时间：</b>{photo.get('created_at')}</p>"
-            if photo.get('file_hash'):
-                info_html += f"<p><b>文件哈希：</b>{photo.get('file_hash')[:16]}...</p>"
-            
-            info_html += "<hr><p><i>双击缩略图可打开预览窗口</i></p>"
-        else:
-            info_html += """
-            <p><b>文件名：</b>文件不存在</p>
-            <p><b>状态：</b>文件路径无效或文件已被移动</p>
-            <hr>
-            <p><i>请检查文件是否存在</i></p>
-            """
-        
-        # 更新右侧信息面板
-        self.info_display.setHtml(info_html)
+        """在右侧面板显示照片信息（统一渲染）。"""
+        try:
+            self.render_photo_info(photo)
+        except Exception as e:
+            print(f"渲染照片信息失败: {e}")
+            # 最简回退：显示文件名
+            self.info_display.setHtml(f"<h3>照片信息</h3><p><b>文件名：</b>{photo.get('filename','--')}</p>")
     
 
         
@@ -587,10 +540,40 @@ class MainWindow(QMainWindow):
 <p><i>请选择一张照片查看详细信息</i></p>
         """
         self.info_display.setHtml(default_info)
-        right_layout.addWidget(self.info_display)
+        # 设置拉伸因子为1，使照片信息栏能够占用可用空间
+        right_layout.addWidget(self.info_display, 1)
+
+        # 分割线（信息与地图之间）
+        self.info_map_separator = QFrame()
+        self.info_map_separator.setFrameShape(QFrame.Shape.HLine)
+        self.info_map_separator.setFrameShadow(QFrame.Shadow.Sunken)
+        right_layout.addWidget(self.info_map_separator)
+
+        # 地图区域容器（动态高度，根据GPS信息显示/隐藏）
+        self.map_holder = QWidget()
+        self.map_holder.setMinimumHeight(250)
+        self.map_holder.setMaximumHeight(250)
+        self.map_layout = QVBoxLayout(self.map_holder)
+        self.map_layout.setContentsMargins(0, 0, 0, 0)
+        self.map_layout.setSpacing(0)
+        right_layout.addWidget(self.map_holder)
+
+        # 先放一个占位，实际地图视图延迟创建
+        placeholder = QLabel("未检测到GPS信息")
+        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        placeholder.setStyleSheet("QLabel { color: #666; background:#f8f9fa; border:1px solid #ddd; }")
+        self.map_layout.addWidget(placeholder)
+        self._map_view = None
+        self._map_placeholder = placeholder
+        self._map_loading = False  # 地图加载状态标志
         
-        # 添加弹性空间，使信息区域占满剩余空间
-        right_layout.addStretch()
+        # 提前初始化WebEngine组件（如果可用）
+        if WEB_ENGINE_AVAILABLE:
+            QTimer.singleShot(100, self.pre_initialize_map_view)
+        
+        # 初始状态：隐藏地图区域和分割线
+        self.map_holder.setVisible(False)
+        self.info_map_separator.setVisible(False)
         
         # 添加到分割器
         self.main_splitter.addWidget(right_widget)
@@ -785,63 +768,446 @@ class MainWindow(QMainWindow):
             
         self.status_bar.showMessage(f"已选择照片: {photo['filename']}")
         
-        # 格式化文件大小
-        size_mb = photo['size'] / (1024 * 1024)
-        size_str = f"{size_mb:.2f} MB" if size_mb >= 1 else f"{photo['size'] / 1024:.1f} KB"
-        
-        # 格式化日期
-        created_at = photo.get('created_at', '未知')
-        imported_at = photo.get('imported_at', '未知')
-        if created_at != '未知':
-            try:
-                from datetime import datetime
-                dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                created_at = dt.strftime('%Y-%m-%d %H:%M:%S')
-            except:
-                pass
-        
-        if imported_at != '未知':
-            try:
-                from datetime import datetime
-                dt = datetime.fromisoformat(imported_at.replace('Z', '+00:00'))
-                imported_at = dt.strftime('%Y-%m-%d %H:%M:%S')
-            except:
-                pass
-        
-        # 获取EXIF信息
-        exif_info = ""
-        if photo.get('exif_data'):
-            exif_data = photo['exif_data']
-            if 'Camera' in exif_data:
-                exif_info += f"<p><b>相机型号：</b>{exif_data['Camera']}</p>"
-            if 'DateTime' in exif_data:
-                exif_info += f"<p><b>拍摄时间：</b>{exif_data['DateTime']}</p>"
-            if 'ImageWidth' in exif_data and 'ImageHeight' in exif_data:
-                exif_info += f"<p><b>分辨率：</b>{exif_data['ImageWidth']} × {exif_data['ImageHeight']}</p>"
-            if 'GPS' in exif_data:
-                exif_info += f"<p><b>GPS信息：</b>{exif_data['GPS']}</p>"
-        
-        # 更新右侧信息面板
-        photo_info = f"""
-<h3>照片信息</h3>
-<p><b>文件名：</b>{photo['filename']}</p>
-<p><b>文件路径：</b>{photo['path']}</p>
-<p><b>文件大小：</b>{size_str}</p>
-<p><b>文件类型：</b>{photo['type'].upper()}</p>
-<p><b>MD5值：</b>{photo['md5'][:16]}...</p>
-<p><b>创建时间：</b>{created_at}</p>
-<p><b>导入时间：</b>{imported_at}</p>
-{exif_info}
-<hr>
-<p><i>照片ID: {photo['id']}</i></p>
-        """
-        self.info_display.setHtml(photo_info)
+        # 统一渲染右侧信息栏
+        try:
+            self.render_photo_info(photo)
+        except Exception as e:
+            print(f"渲染照片信息失败: {e}")
+            self.info_display.setHtml(f"<h3>照片信息</h3><p><b>文件名：</b>{photo.get('filename','--')}</p>")
         
         # 更新预览区域
         self.update_photo_preview(photo)
         
         print(f"照片点击: {photo['filename']} (ID: {photo['id']})")
+
+    def parse_gps(self, exif_data):
+        """解析EXIF中的GPS信息为十进制度坐标。返回 (lat, lon) 或 None。"""
+        if not exif_data:
+            return None
             
+        # 首先尝试从字符串格式的GPS字段读取（兼容旧格式）
+        gps_str = exif_data.get('GPS') if isinstance(exif_data, dict) else None
+        if isinstance(gps_str, str):
+            try:
+                parts = gps_str.replace(';', ',').replace('|', ',').split(',')
+                if len(parts) >= 2:
+                    lat = float(parts[0].strip())
+                    lon = float(parts[1].strip())
+                    return (lat, lon)
+            except Exception:
+                pass
+
+        # 获取GPS信息，优先从GPSInfo子字段中读取
+        gps_info = None
+        if isinstance(exif_data, dict):
+            # 首先尝试从GPSInfo子字段读取
+            gps_info = exif_data.get('GPSInfo')
+            # 如果GPSInfo不存在，尝试直接从根级别读取（兼容性）
+            if not gps_info:
+                gps_info = exif_data
+
+        if not gps_info:
+            return None
+
+        def _to_float(v):
+            try:
+                if isinstance(v, (int, float)):
+                    return float(v)
+                if isinstance(v, tuple) and len(v) == 2:
+                    return float(v[0]) / float(v[1]) if float(v[1]) != 0 else 0.0
+                if isinstance(v, str):
+                    if '/' in v:
+                        num, den = v.split('/')
+                        den_f = float(den) if float(den) != 0 else 1.0
+                        return float(num) / den_f
+                    return float(v)
+            except Exception:
+                return 0.0
+            return 0.0
+
+        def dms_to_deg(dms):
+            if not dms or len(dms) < 3:
+                return None
+            deg = _to_float(dms[0])
+            minute = _to_float(dms[1])
+            sec = _to_float(dms[2])
+            return deg + minute / 60.0 + sec / 3600.0
+
+        # 从GPS信息中提取坐标数据
+        lat_vals = gps_info.get('GPSLatitude') if isinstance(gps_info, dict) else None
+        lon_vals = gps_info.get('GPSLongitude') if isinstance(gps_info, dict) else None
+        lat_ref = gps_info.get('GPSLatitudeRef', 'N') if isinstance(gps_info, dict) else 'N'
+        lon_ref = gps_info.get('GPSLongitudeRef', 'E') if isinstance(gps_info, dict) else 'E'
+
+        if isinstance(lat_vals, (list, tuple)) and isinstance(lon_vals, (list, tuple)):
+            lat_deg = dms_to_deg(lat_vals)
+            lon_deg = dms_to_deg(lon_vals)
+            if lat_deg is not None and lon_deg is not None:
+                if str(lat_ref).upper().startswith('S'):
+                    lat_deg = -abs(lat_deg)
+                if str(lon_ref).upper().startswith('W'):
+                    lon_deg = -abs(lon_deg)
+                return (lat_deg, lon_deg)
+
+        return None
+
+    def update_photo_preview(self, photo):
+        """更新中部预览区域（如果存在），不影响双击弹窗预览。"""
+        try:
+            possible_paths = [
+                photo.get('path', ''),
+                photo.get('file_path', ''),
+                os.path.join(self.photo_library_path, photo.get('path', '')),
+                os.path.join(self.photo_library_path, photo.get('file_path', ''))
+            ]
+            photo_path = next((p for p in possible_paths if p and os.path.exists(p)), None)
+
+            if hasattr(self, 'preview_label') and self.preview_label is not None:
+                if photo_path and os.path.exists(photo_path):
+                    pixmap = QPixmap(photo_path)
+                    if not pixmap.isNull():
+                        # 适配预览标签大小（若有固定尺寸则缩放）
+                        target_size = self.preview_label.size() if self.preview_label.size().isValid() else QSize(400, 300)
+                        scaled = pixmap.scaled(target_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                        self.preview_label.setPixmap(scaled)
+                        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                        self.preview_label.setText("")  # 清空占位文字
+                    else:
+                        self.preview_label.setText("无法加载预览图片")
+                else:
+                    self.preview_label.setText("预览不可用（文件缺失或路径无效）")
+            else:
+                # 没有预览区域则仅更新状态栏，避免报错
+                if photo_path and os.path.exists(photo_path):
+                    self.status_bar.showMessage(f"预览就绪：{os.path.basename(photo_path)}")
+                else:
+                    self.status_bar.showMessage("预览不可用：未找到有效文件路径")
+        except Exception as e:
+            print(f"更新预览区域失败: {e}")
+    
+    def pre_initialize_map_view(self):
+        """预初始化地图视图（在后台创建WebEngine组件）"""
+        if WEB_ENGINE_AVAILABLE and self._map_view is None and not self._map_loading:
+            self._map_loading = True
+            try:
+                self._map_view = QWebEngineView()
+                self._map_view.setMinimumHeight(250)
+                self._map_view.setMaximumHeight(250)
+                self._map_view.setVisible(False)  # 先隐藏
+                self.map_layout.addWidget(self._map_view)
+                
+                # 预加载基础地图HTML（不显示具体位置）
+                base_html = """
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta charset="utf-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+                    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+                    <style>
+                        body { margin: 0; padding: 0; }
+                        #map { height: 100vh; width: 100%; }
+                        .loading-overlay {
+                            position: absolute;
+                            top: 50%;
+                            left: 50%;
+                            transform: translate(-50%, -50%);
+                            background: rgba(255,255,255,0.9);
+                            padding: 10px 20px;
+                            border-radius: 5px;
+                            font-family: Arial, sans-serif;
+                            color: #666;
+                        }
+                    </style>
+                </head>
+                <body>
+                    <div id="map"></div>
+                    <div id="loading" class="loading-overlay">地图加载中...</div>
+                    <script>
+                        // 预加载地图组件
+                        var map = L.map('map').setView([39.9042, 116.4074], 2);
+                        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                            attribution: '© OpenStreetMap contributors'
+                        }).addTo(map);
+                        
+                        // 隐藏加载提示
+                        setTimeout(function() {
+                            var loading = document.getElementById('loading');
+                            if (loading) loading.style.display = 'none';
+                        }, 1000);
+                    </script>
+                </body>
+                </html>
+                """
+                self._map_view.setHtml(base_html)
+                print("地图组件预初始化完成")
+            except Exception as e:
+                print(f"地图预初始化失败: {e}")
+                self._map_view = None
+            finally:
+                self._map_loading = False
+
+    def ensure_map_view(self):
+        """懒加载地图视图或占位控件，并缓存以复用。"""
+        # 始终确保分割线和容器存在
+        if hasattr(self, 'info_map_separator'):
+            self.info_map_separator.setVisible(True)
+        if hasattr(self, 'map_holder'):
+            self.map_holder.setVisible(True)
+
+        if WEB_ENGINE_AVAILABLE:
+            # 创建或显示 WebEngine 地图
+            if self._map_view is None:
+                try:
+                    self._map_view = QWebEngineView()
+                    self._map_view.setMinimumHeight(250)
+                    self._map_view.setMaximumHeight(250)
+                    self._map_view.setVisible(False)
+                    self.map_layout.addWidget(self._map_view)
+                except Exception:
+                    # 如果创建失败，退回占位
+                    self._map_view = None
+            # 隐藏占位
+            if self._map_placeholder is not None:
+                self._map_placeholder.setVisible(False)
+        else:
+            # WebEngine 不可用：确保占位存在并显示
+            if self._map_placeholder is None:
+                placeholder = QLabel("未检测到GPS信息或未安装WebEngine")
+                placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                placeholder.setStyleSheet("QLabel { color: #666; background:#f8f9fa; border:1px solid #ddd; }")
+                self.map_layout.addWidget(placeholder)
+                self._map_placeholder = placeholder
+            self._map_placeholder.setVisible(True)
+
+    def update_map(self, lat=None, lon=None):
+        """更新地图显示到指定坐标；无坐标时隐藏地图区域。"""
+        # 无坐标，隐藏地图区域
+        if lat is None or lon is None:
+            self._hide_map_area()
+            return
+
+        # 有坐标，显示并加载地图（若可用）
+        if WEB_ENGINE_AVAILABLE:
+            self._show_map_area()
+            self.ensure_map_view()
+            if self._map_view is None:
+                # 回退到占位
+                self._show_map_placeholder("未检测到GPS信息或未安装WebEngine")
+                return
+
+            # 如果地图已经预初始化，直接更新位置
+            if self._map_view.isVisible() == False:
+                # 首次显示地图，添加平滑过渡
+                self._show_map_loading()
+                QTimer.singleShot(50, lambda: self._load_map_location(lat, lon))
+            else:
+                # 地图已显示，直接更新位置
+                self._load_map_location(lat, lon)
+        else:
+            # WebEngine不可用，显示地图区域但显示占位符
+            self._show_map_area()
+            self._show_map_placeholder("未检测到GPS信息或未安装WebEngine")
+
+    def _show_map_placeholder(self, text):
+        """显示地图占位符"""
+        if self._map_view is not None:
+            self._map_view.setVisible(False)
+        if self._map_placeholder is None:
+            self._map_placeholder = QLabel(text)
+            self._map_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._map_placeholder.setStyleSheet("QLabel { color: #666; background:#f8f9fa; border:1px solid #ddd; }")
+            self.map_layout.addWidget(self._map_placeholder)
+        else:
+            self._map_placeholder.setText(text)
+        self._map_placeholder.setVisible(True)
+
+    def _show_map_loading(self):
+        """显示地图加载状态"""
+        if self._map_placeholder is not None:
+            self._map_placeholder.setText("地图加载中...")
+            self._map_placeholder.setVisible(True)
+
+    def _show_map_area(self):
+        """显示地图区域和分割线"""
+        self.map_holder.setVisible(True)
+        self.info_map_separator.setVisible(True)
+
+    def _hide_map_area(self):
+        """隐藏地图区域和分割线"""
+        self.map_holder.setVisible(False)
+        self.info_map_separator.setVisible(False)
+
+    def _load_map_location(self, lat, lon):
+        """加载地图到指定位置"""
+        try:
+            lat_f = float(lat)
+            lon_f = float(lon)
+            html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset='utf-8' />
+  <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+  <link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css' />
+  <script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>
+  <style>
+    html, body {{ margin:0; padding:0; }} 
+    #map {{ width: 100%; height: 250px; }}
+    .map-fade-in {{ 
+      opacity: 0; 
+      transition: opacity 0.3s ease-in-out; 
+    }}
+    .map-fade-in.loaded {{ 
+      opacity: 1; 
+    }}
+  </style>
+</head>
+<body>
+  <div id='map' class='map-fade-in'></div>
+  <script>
+    var map = L.map('map').setView([{lat_f:.6f}, {lon_f:.6f}], 15);
+    L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap'
+    }}).addTo(map);
+    L.marker([{lat_f:.6f}, {lon_f:.6f}]).addTo(map)
+      .bindPopup('拍摄位置<br>纬度: {lat_f:.6f}<br>经度: {lon_f:.6f}');
+    
+    // 地图加载完成后添加淡入效果
+    setTimeout(function() {{
+      document.getElementById('map').classList.add('loaded');
+    }}, 100);
+  </script>
+</body>
+</html>
+"""
+            self._map_view.setHtml(html)
+            
+            # 延迟显示地图，创建平滑过渡效果
+            QTimer.singleShot(200, self._show_map_view)
+            
+        except Exception as e:
+            print(f"地图加载失败: {e}")
+            self._show_map_placeholder("地图加载失败")
+
+    def _show_map_view(self):
+        """显示地图视图"""
+        if self._map_view is not None:
+            self._map_view.setVisible(True)
+        if self._map_placeholder is not None:
+            self._map_placeholder.setVisible(False)
+
+    def render_photo_info(self, photo):
+        """统一渲染右侧信息栏，并根据GPS更新地图。"""
+        # 路径解析
+        possible_paths = [
+            photo.get('path', ''),
+            photo.get('file_path', ''),
+            os.path.join(self.photo_library_path, photo.get('path', '')),
+            os.path.join(self.photo_library_path, photo.get('file_path', ''))
+        ]
+        photo_path = next((p for p in possible_paths if p and os.path.exists(p)), None)
+
+        # 基本信息
+        filename = (os.path.basename(photo_path) if photo_path else photo.get('filename')) or '--'
+        file_size_bytes = None
+        if photo_path and os.path.exists(photo_path):
+            try:
+                file_size_bytes = os.path.getsize(photo_path)
+            except Exception:
+                file_size_bytes = None
+        if file_size_bytes is None:
+            file_size_bytes = photo.get('size')
+        if isinstance(file_size_bytes, int) and file_size_bytes >= 1024 * 1024:
+            size_str = f"{file_size_bytes / (1024*1024):.2f} MB"
+        elif isinstance(file_size_bytes, int):
+            size_str = f"{file_size_bytes / 1024:.1f} KB"
+        else:
+            size_str = '--'
+
+        # 预览分辨率
+        resolution = '--'
+        if photo_path:
+            try:
+                pixmap = QPixmap(photo_path)
+                if not pixmap.isNull():
+                    resolution = f"{pixmap.width()} × {pixmap.height()}"
+            except Exception:
+                pass
+
+        # 数据库字段
+        file_type = (photo.get('type') or '--').upper() if photo.get('type') else '--'
+        md5 = photo.get('md5') or photo.get('file_hash') or '--'
+        if md5 != '--':
+            md5 = md5[:16] + ('...' if len(md5) > 16 else '')
+
+        from datetime import datetime
+        def fmt_time(v):
+            if not v:
+                return '--'
+            try:
+                s = str(v)
+                s = s.replace('Z', '+00:00')
+                dt = datetime.fromisoformat(s)
+                return dt.strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                try:
+                    # 尝试时间戳
+                    return datetime.fromtimestamp(float(v)).strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    return str(v)
+
+        created_time = fmt_time(photo.get('created_at'))
+        imported_time = fmt_time(photo.get('imported_at') or photo.get('created_at'))
+
+        # EXIF
+        exif = photo.get('exif_data') or {}
+        camera_model = exif.get('Camera') or exif.get('Model') or '--'
+        shoot_time = exif.get('DateTime') or exif.get('DateTimeOriginal') or '--'
+        exif_res = '--'
+        if isinstance(exif, dict) and ('ImageWidth' in exif and 'ImageHeight' in exif):
+            exif_res = f"{exif.get('ImageWidth')} × {exif.get('ImageHeight')}"
+
+        # GPS
+        gps_coords = None
+        try:
+            gps_coords = self.parse_gps(exif)
+        except Exception:
+            gps_coords = None
+
+        # 组装HTML
+        info_html = f"""
+<h3>基本信息</h3>
+<p><b>文件名：</b>{filename}</p>
+<p><b>文件大小：</b>{size_str}</p>
+<p><b>分辨率：</b>{resolution}</p>
+<p><b>文件路径：</b>{(photo_path or photo.get('path') or '--')}</p>
+<hr>
+<h3>数据库字段</h3>
+<p><b>文件类型：</b>{file_type}</p>
+<p><b>MD5：</b>{md5}</p>
+<p><b>创建时间：</b>{created_time}</p>
+<p><b>导入时间：</b>{imported_time}</p>
+<hr>
+<h3>EXIF元数据</h3>
+<p><b>相机型号：</b>{camera_model}</p>
+<p><b>拍摄时间：</b>{shoot_time}</p>
+<p><b>分辨率：</b>{exif_res}</p>
+<p><b>GPS：</b>{('--' if gps_coords is None else f"{gps_coords[0]:.6f}, {gps_coords[1]:.6f}")}</p>
+<hr>
+<p><i>双击缩略图可打开预览窗口</i></p>
+"""
+
+        self.info_display.setHtml(info_html)
+
+        # 更新地图
+        if gps_coords is None:
+            self.update_map(None, None)
+        else:
+            self.update_map(gps_coords[0], gps_coords[1])
+        
     def on_thumbnail_clicked(self, index):
         """示例缩略图点击事件（兼容性保留）"""
         self.status_bar.showMessage(f"已选择照片 {index+1:02d}")

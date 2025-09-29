@@ -14,7 +14,7 @@
 ## 系统要求
 
 - Python 3.7+
-- PyQt5
+- PyQt6
 - 支持的操作系统：Windows 10+, macOS 10.14+, Ubuntu 18.04+
 
 ## 安装和运行

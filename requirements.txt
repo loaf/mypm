@@ -2,6 +2,7 @@
 
 # GUI框架
 PyQt6>=6.0.0
+PyQt6-WebEngine>=6.0.0
 
 # 图像处理
 Pillow>=8.0.0

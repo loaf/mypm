@@ -14,7 +14,7 @@ import json
 from PyQt6.QtCore import QThread, pyqtSignal, QObject
 from PyQt6.QtWidgets import QFileDialog, QWidget
 from PIL import Image
-from PIL.ExifTags import TAGS
+from PIL.ExifTags import TAGS, GPSTAGS
 import exifread
 
 from db.database_manager import DatabaseManager
@@ -270,16 +270,22 @@ class PhotoImporter:
             # 复制文件（处理重命名冲突）
             final_path = copy_file_with_conflict_resolution(file_path, target_path)
             
+            # 提取EXIF数据
+            exif_data = extract_exif_data(file_path)
+            
             # 添加到数据库
             filename = os.path.basename(final_path)
             relative_path = os.path.relpath(final_path, self.target_dir)
+            file_ext = os.path.splitext(filename)[1].lower().lstrip('.')
             
             photo_id = db_manager.add_photo_record(
                 filename=filename,
                 relative_path=relative_path,
                 md5=md5_hash,
                 size=file_size,
-                created_at=photo_time.isoformat() if photo_time else datetime.now().isoformat()
+                created_at=photo_time.isoformat() if photo_time else datetime.now().isoformat(),
+                photo_type=file_ext,
+                exif_data=exif_data
             )
             
             db_manager.close()
@@ -498,12 +504,63 @@ def extract_exif_data(file_path: str) -> Optional[Dict[str, Any]]:
                 readable_exif = {}
                 for tag_id, value in exif_data.items():
                     tag = TAGS.get(tag_id, tag_id)
-                    # 只保存字符串和数字类型的值
-                    if isinstance(value, (str, int, float)):
+                    
+                    # 处理GPS信息
+                    if tag == 'GPSInfo' and isinstance(value, dict):
+                        gps_data = {}
+                        for gps_tag_id, gps_value in value.items():
+                            gps_tag = GPSTAGS.get(gps_tag_id, gps_tag_id)
+                            
+                            # 转换GPS值为可序列化格式
+                            if isinstance(gps_value, (str, int, float)):
+                                gps_data[gps_tag] = gps_value
+                            elif hasattr(gps_value, '__float__'):
+                                # 处理IFDRational等可转换为float的类型
+                                gps_data[gps_tag] = float(gps_value)
+                            elif isinstance(gps_value, tuple):
+                                # GPS坐标通常是三元组 (度, 分, 秒)
+                                converted_tuple = []
+                                for item in gps_value:
+                                    if hasattr(item, '__float__'):
+                                        converted_tuple.append(float(item))
+                                    else:
+                                        converted_tuple.append(item)
+                                gps_data[gps_tag] = converted_tuple
+                            elif isinstance(gps_value, bytes):
+                                # 将bytes转换为十六进制字符串
+                                gps_data[gps_tag] = gps_value.hex()
+                            else:
+                                # 其他类型转换为字符串
+                                gps_data[gps_tag] = str(gps_value)
+                        
+                        readable_exif[tag] = gps_data
+                    
+                    # 处理其他EXIF数据
+                    elif isinstance(value, (str, int, float)):
                         readable_exif[tag] = value
+                    elif hasattr(value, '__float__'):
+                        # 处理IFDRational等可转换为float的类型
+                        readable_exif[tag] = float(value)
                     elif isinstance(value, tuple) and len(value) == 2:
                         # 处理分数格式（如光圈值）
-                        readable_exif[tag] = f"{value[0]}/{value[1]}"
+                        if hasattr(value[0], '__float__') and hasattr(value[1], '__float__'):
+                            readable_exif[tag] = f"{float(value[0])}/{float(value[1])}"
+                        else:
+                            readable_exif[tag] = f"{value[0]}/{value[1]}"
+                    elif isinstance(value, tuple):
+                        # 处理其他元组类型
+                        converted_tuple = []
+                        for item in value:
+                            if hasattr(item, '__float__'):
+                                converted_tuple.append(float(item))
+                            elif isinstance(item, bytes):
+                                converted_tuple.append(item.hex())
+                            else:
+                                converted_tuple.append(item)
+                        readable_exif[tag] = converted_tuple
+                    elif isinstance(value, bytes):
+                        # 处理bytes类型
+                        readable_exif[tag] = value.hex()
                 
                 return readable_exif
                 
